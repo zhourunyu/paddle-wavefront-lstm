@@ -72,8 +72,8 @@ struct CellModel {
     float bias[kLstmGateNumber][kHiddenSize];
 };
 static_assert(sizeof(CellModel) == sizeof(CellModel::weights_w) +
-                                       sizeof(CellModel::weights_u) +
-                                       sizeof(CellModel::bias),
+                                   sizeof(CellModel::weights_u) +
+                                   sizeof(CellModel::bias),
               "Expect the data to be placed continuously.");
 
 #pragma pack(push, 1)
@@ -81,6 +81,10 @@ struct ModelParams {
     CellModel cell_model[kCellNumber];
 };
 #pragma pack(pop)
+
+struct InputData {
+    float data[kLstmTimestep][kInputSize];
+};
 
 struct CellState {
     float data[kHiddenSize];
@@ -92,7 +96,7 @@ struct CellTemp {
 
 #pragma pack(push, 1)
 struct CellParams {
-    CellState cell_state_h[kCellNumber + 1][kLstmTimestep + 1];
+    CellState cell_state_h[kCellNumber][kLstmTimestep + 1];
     CellState cell_state_c[kCellNumber];
     CellTemp cell_temp[kCellNumber];
 };
@@ -102,6 +106,7 @@ struct CellParams {
 struct WaveKernelParams {
     CUdeviceptr d_model_params;
     CUdeviceptr d_cell_params;
+    CUdeviceptr d_input_data;
     int step_start_num;
     int layer_start_num;
 };
@@ -123,7 +128,7 @@ private:
 class WavefrontLSTM {
 public:
     explicit WavefrontLSTM(const float *src_model);
-    bool Initialize(const float *input);
+    bool Initialize(const float *input, float *state);
     void Solve();
     bool Fetch(float *output);
     void Finalize();
@@ -136,79 +141,71 @@ private:
     CUdeviceptr d_output_;
 };
 
-__global__ void wave_compute(ModelParams *d_model_params,
-                             CellParams *d_cell_params, int step_start_num,
-                             int layer_start_num);
+__global__ void wave_compute(ModelParams *d_model_params, CellParams *d_cell_params, 
+                             InputData *d_input_data, int step_start_num, int layer_start_num);
 
 Wave::Wave() {
-  CU_CHECK(cuInit(0));
-  CU_CHECK(cuDeviceGet(&cu_device_, 0));
-  CU_CHECK(cuCtxCreate(&cu_context_, 0, cu_device_));
-  CUDA_CHECK(
-      cudaGetFuncBySymbol(&cu_wave_compute_, (const void *)wave_compute));
+    CU_CHECK(cuInit(0));
+    CU_CHECK(cuDeviceGet(&cu_device_, 0));
+    CU_CHECK(cuCtxCreate(&cu_context_, 0, cu_device_));
+    CUDA_CHECK(
+        cudaGetFuncBySymbol(&cu_wave_compute_, (const void *)wave_compute));
 }
 
 void Wave::Finalize() { CU_CHECK(cuCtxDestroy(cu_context_)); }
 
 void Wave::Compute(int wave_size, WaveKernelParams kernel_params) {
-  CU_CHECK(LaunchKernel(cu_wave_compute_, kGemvBlockNumber * wave_size,
-                        kHiddenSize, 0, kernel_params));
+    CU_CHECK(LaunchKernel(cu_wave_compute_, kGemvBlockNumber * wave_size,
+                          kHiddenSize, 0, kernel_params));
 }
 
 void Wave::InitCellParams(CUdeviceptr d_cell_params) {
-  CU_CHECK(cuMemsetD32(
-      d_cell_params, 0.000000e+00f,
-      (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)) /
-          sizeof(float)));
+    CU_CHECK(cuMemsetD32(
+        d_cell_params, 0.000000e+00f,
+        (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)) /
+            sizeof(float)));
 }
 
 WavefrontLSTM::WavefrontLSTM(const float *src_model) {
-  CU_CHECK(cuMemAlloc(&d_model_params_, sizeof(ModelParams)));
-  CU_CHECK(cuMemAlloc(&d_cell_params_, sizeof(CellParams)));
-  CU_CHECK(
-      cuMemcpyDtoD(d_model_params_, (CUdeviceptr)src_model, sizeof(ModelParams)));
-
-  d_input_ = d_cell_params_ + sizeof(CellState);
-  d_output_ = d_cell_params_ + sizeof(CellParams::cell_state_h) -
-              kLstmTimestep * sizeof(CellState);
+    d_model_params_ = (CUdeviceptr)src_model;
 }
 
-bool WavefrontLSTM::Initialize(const float *input) {
-  wave_.InitCellParams(d_cell_params_);
-  CU_CHECK(
-      cuMemcpyDtoD(d_input_, (CUdeviceptr)input, sizeof(CellState) * kLstmTimestep));
-  return true;
+bool WavefrontLSTM::Initialize(const float *input, float *state) {
+    d_cell_params_ = (CUdeviceptr)state;
+    wave_.InitCellParams(d_cell_params_);
+    d_input_ = (CUdeviceptr)input;
+    d_output_ = d_cell_params_ + sizeof(CellParams::cell_state_h) -
+                kLstmTimestep * sizeof(CellState);
+    return true;
 }
 
 void WavefrontLSTM::Solve() {
-  const int max_wave_size = std::min(kCellNumber, kLstmTimestep);
-  const int max_wave_number = kCellNumber + kLstmTimestep - 1;
+    const int max_wave_size = std::min(kCellNumber, kLstmTimestep);
+    const int max_wave_number = kCellNumber + kLstmTimestep - 1;
 
-  for (int wave_idx = 1; wave_idx <= max_wave_number; ++wave_idx) {
-    int wave_size = (wave_idx < std::max(kCellNumber, kLstmTimestep))
+    for (int wave_idx = 1; wave_idx <= max_wave_number; ++wave_idx) {
+        int wave_size = (wave_idx < std::max(kCellNumber, kLstmTimestep))
                         ? std::min(wave_idx, max_wave_size)
                         : (max_wave_size -
                            (wave_idx - std::max(kCellNumber, kLstmTimestep)));
-    int step_start_num = (wave_idx < kLstmTimestep) ? wave_idx : kLstmTimestep;
-    int layer_start_num =
-        (wave_idx < kLstmTimestep) ? 1 : (wave_idx - kLstmTimestep + 1);
+        int step_start_num = (wave_idx < kLstmTimestep) ? wave_idx : kLstmTimestep;
+        int layer_start_num =
+            (wave_idx < kLstmTimestep) ? 0 : (wave_idx - kLstmTimestep);
 
-    WaveKernelParams kernel_params = {d_model_params_, d_cell_params_,
-                                      step_start_num, layer_start_num};
-    wave_.Compute(wave_size, kernel_params);
-  }
+        WaveKernelParams kernel_params = {d_model_params_, d_cell_params_, d_input_,
+                                          step_start_num, layer_start_num};
+        wave_.Compute(wave_size, kernel_params);
+    }
 }
 
 bool WavefrontLSTM::Fetch(float *output) {
-  CU_CHECK(cuMemcpyDtoD((CUdeviceptr)output, d_output_,
-                        sizeof(CellState) * kLstmTimestep));
-  return true;
+    CU_CHECK(cuMemcpyDtoD((CUdeviceptr)output, d_output_,
+                          sizeof(CellState) * kLstmTimestep));
+    return true;
 }
 
 void WavefrontLSTM::Finalize() {
-  CU_CHECK(cuMemFree(d_model_params_));
-  CU_CHECK(cuMemFree(d_cell_params_));
-  wave_.Finalize();
+    wave_.Finalize();
 }
 
 __device__ static inline float sigmoid(float x) {
@@ -216,18 +213,18 @@ __device__ static inline float sigmoid(float x) {
 }
 
 __global__ void __launch_bounds__(256, 4)
-    wave_compute(ModelParams *d_model_params, CellParams *d_cell_params,
-                 int step_start_num, int layer_start_num) {
+wave_compute(ModelParams *d_model_params, CellParams *d_cell_params, 
+             InputData *d_input_data, int step_start_num, int layer_start_num) {
     const int cell_idx = layer_start_num + blockIdx.x / kGemvBlockNumber;
     const int step_idx = step_start_num - blockIdx.x / kGemvBlockNumber;
-    CellState *d_input = &d_cell_params->cell_state_h[cell_idx - 1][step_idx];
+    float *d_input = (cell_idx == 0)? &d_input_data->data[step_idx - 1][0]: d_cell_params->cell_state_h[cell_idx - 1][step_idx].data;
     CellState *d_input_state_h =
         &d_cell_params->cell_state_h[cell_idx][step_idx - 1];
     CellState *d_output_state_h =
         &d_cell_params->cell_state_h[cell_idx][step_idx];
-    CellState *d_state_c = &d_cell_params->cell_state_c[cell_idx - 1];
-    CellTemp *d_temp = &d_cell_params->cell_temp[cell_idx - 1];
-    CellModel *d_model = &d_model_params->cell_model[cell_idx - 1];
+    CellState *d_state_c = &d_cell_params->cell_state_c[cell_idx];
+    CellTemp *d_temp = &d_cell_params->cell_temp[cell_idx];
+    CellModel *d_model = &d_model_params->cell_model[cell_idx];
 
     const int warp_idx = threadIdx.x / kThreadsPerWarp;
     const int lane_idx = threadIdx.x % kThreadsPerWarp;
@@ -246,7 +243,7 @@ __global__ void __launch_bounds__(256, 4)
     const int row_start_idx = kRowsPerWarp * warp_idx;
     const int row_end_idx = row_start_idx + kRowsPerWarp;
     for (int row_idx = row_start_idx; row_idx < row_end_idx; ++row_idx) {
-        float input_data = d_input->data[row_idx];
+        float input_data = d_input[row_idx];
         float state_h_data = d_input_state_h->data[row_idx];
         for (int i = 0; i < kLstmGateNumber; ++i) {
             temp[i] =
@@ -279,7 +276,7 @@ __global__ void __launch_bounds__(256, 4)
     }
 }
 
-std::vector<paddle::Tensor> wavefront_lstm_forward(const paddle::Tensor &x, const paddle::Tensor &w, int hidden_size, int num_layers, int time_steps) {
+std::vector<paddle::Tensor> wavefront_lstm_forward(const paddle::Tensor &x, const paddle::Tensor &w, paddle::Tensor &state) {
     CHECK_GPU_INPUT(x);
     PD_CHECK(x.place() == paddle::DefaultGPUPlace());
 
@@ -290,10 +287,11 @@ std::vector<paddle::Tensor> wavefront_lstm_forward(const paddle::Tensor &x, cons
         auto x_data = x.data<float>();
         auto w_data = w.data<float>();
         auto out_data = out.data<float>();
+        auto state_data = state.data<float>();
 
         auto network = new WavefrontLSTM(w_data);
 
-        network->Initialize(x_data);
+        network->Initialize(x_data, state_data);
         network->Solve();
         network->Fetch(out_data);
         network->Finalize();

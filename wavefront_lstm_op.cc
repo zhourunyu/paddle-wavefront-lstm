@@ -17,20 +17,20 @@
 
 #include "paddle/extension.h"
 
-std::vector<paddle::Tensor> wavefront_lstm_forward(const paddle::Tensor &x, const paddle::Tensor &w, int hidden_size, int num_layers, int time_steps);
+std::vector<paddle::Tensor> wavefront_lstm_forward(const paddle::Tensor &x, const paddle::Tensor &w, paddle::Tensor &state);
 
-std::vector<paddle::Tensor> WavefrontLstmForward(const paddle::Tensor &x, const paddle::Tensor &w, int hidden_size, int num_layers, int time_steps) {
+std::vector<paddle::Tensor> WavefrontLstmForward(const paddle::Tensor &x, const paddle::Tensor &w, paddle::Tensor &state) {
     if (x.is_gpu()) {
-        return wavefront_lstm_forward(x, w, hidden_size, num_layers, time_steps);
+        return wavefront_lstm_forward(x, w, state);
     } else {
         PD_THROW("Not implemented.");
     }
 }
 
 PD_BUILD_OP(wavefront_lstm)
-    .Inputs({"X", "W"})
+    .Inputs({"X", "W", "State"})
     .Outputs({"Out"})
-    .Attrs({"hidden_size: int",
-            "num_layers: int",
-            "time_steps: int"})
+    // .Attrs({"hidden_size: int",
+    //         "num_layers: int",
+    //         "time_steps: int"})
     .SetKernelFn(PD_KERNEL(WavefrontLstmForward));
